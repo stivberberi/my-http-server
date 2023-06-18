@@ -5,32 +5,18 @@ use std::{
     thread,
 };
 
-// custom PoolCreationError
+// custom PoolCreationError. Implementation at the bottom
 #[derive(Debug)]
 pub struct PoolCreationError {
     message: String,
 }
 
-impl PoolCreationError {
-    fn new(msg: &str) -> PoolCreationError {
-        PoolCreationError {
-            message: String::from(msg),
-        }
-    }
-}
-impl fmt::Display for PoolCreationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "PoolCreationError {}", self.message)
-    }
-}
-impl Error for PoolCreationError {}
+type Job = Box<dyn FnOnce() + Send + 'static>;
 
 pub struct ThreadPool {
     workers: Vec<Worker>,
-    sender: mpsc::Sender<Job>,
+    sender: Option<mpsc::Sender<Job>>,
 }
-
-type Job = Box<dyn FnOnce() + Send + 'static>;
 
 impl ThreadPool {
     /// Create a new ThreadPool.
@@ -54,7 +40,10 @@ impl ThreadPool {
                 workers.push(worker);
             }
 
-            Ok(ThreadPool { workers, sender })
+            Ok(ThreadPool {
+                workers,
+                sender: Some(sender),
+            })
         } else {
             Err(PoolCreationError::new("Size must be larger than 0."))
         }
@@ -66,13 +55,27 @@ impl ThreadPool {
     {
         let job = Box::new(f);
 
-        self.sender.send(job).unwrap();
+        self.sender.as_ref().unwrap().send(job).unwrap();
     }
 }
 
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        // closes the channel when ThreadPool is dropped.
+        drop(self.sender.take());
+
+        for worker in &mut self.workers {
+            println!("Shutting down worker {}", worker.id);
+
+            if let Some(thread) = worker.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+}
 struct Worker {
     id: usize,
-    thread: thread::JoinHandle<()>,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Worker {
@@ -86,14 +89,19 @@ impl Worker {
             // Must use let here (as opposed to if let or while let) so that the
             // temporary mutex variable is dropped (thus releasing the lock),
             // allowing for our servor to process requests in parallel.
-            let job = receiver
-                .lock()
-                .expect("Poisoned mutex. Another thread may have panicked.")
-                .recv()
-                .unwrap();
+            let message = receiver.lock().unwrap().recv();
 
-            println!("Worker {id} got a job; executing.");
-            job();
+            match message {
+                Ok(job) => {
+                    println!("Worker {id} got a job; executing.");
+
+                    job();
+                }
+                Err(_) => {
+                    println!("Worker {id} shutting down.");
+                    break;
+                }
+            }
         }) {
             Ok(thread) => thread,
             Err(_) => {
@@ -102,6 +110,25 @@ impl Worker {
                 ))
             }
         };
-        Ok(Worker { id, thread })
+        Ok(Worker {
+            id,
+            thread: Some(thread),
+        })
     }
 }
+
+impl PoolCreationError {
+    fn new(msg: &str) -> PoolCreationError {
+        PoolCreationError {
+            message: String::from(msg),
+        }
+    }
+}
+
+impl fmt::Display for PoolCreationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PoolCreationError {}", self.message)
+    }
+}
+
+impl Error for PoolCreationError {}
